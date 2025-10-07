@@ -193,6 +193,10 @@ def parse_args():
     p.add_argument('--splat-ks', type=int, default=1)              # 点→体素 splat 核大小
     p.add_argument('--no-channel', action='store_true',            # occupancy 是否带 channel 维
                    help='set to disable channel dim in occupancy')
+    p.add_argument('--solver', type=str, default='ddim', choices=['ddim', 'ddpm'],
+                   help='选择逆扩散求解器: ddim(默认, 可跳步) 或 ddpm(原始随机, 仅相邻步)')
+    p.add_argument('--ddim-eta', type=float, default=0.0,
+                   help='DDIM 方差系数 (eta=0 为确定性, >0 注入噪声)')
 
     # 模型权重路径（新增 DGCNN；DDPM 原有）
     p.add_argument('--dgcnn-ckpt', type=str, default='/home/linux/Documents/FDP/models/classifiers/pretrained/dgcnn_weights/model.1024.t7',
@@ -313,6 +317,11 @@ def main():
 
 
     # --- 频域净化器（保守配置 + 新签名） ---
+    pur_n_steps = None if args.n_steps < 0 else args.n_steps
+    if args.solver == 'ddpm' and pur_n_steps not in (None, 0):
+        print('[WARN] DDPM solver requires sequential steps; ignoring --n-steps and using full schedule.')
+        pur_n_steps = None
+
     purifier = FreqGuidedDiffuser3D(
         denoise3d=denoiser,
         res=args.res,
@@ -325,9 +334,10 @@ def main():
         splat_ks=args.splat_ks,
         use_channel=(not args.no_channel),
         mix_alpha=args.mix_alpha,
-        n_steps=(None if args.n_steps < 0 else args.n_steps),
+        n_steps=pur_n_steps,
         init_from_base=(not args.init_from_noise),
-        deterministic=True,
+        ddim_eta=args.ddim_eta,
+        solver=args.solver,
     ).to(device).eval()
 
     # AMP 上下文（仅净化阶段启用）
