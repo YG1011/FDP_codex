@@ -40,8 +40,8 @@ class FreqGuidedDiffuser3D(nn.Module):
     频域引导的 3D 逆扩散（DDIM 版本）
       - 全程在 [0,1] 数值域
       - 低频幅度混合（向 V_base 靠）+ 低频相位投影（以 V_base 为带）
-      - DDIM 跳步：使用 (t_cur, t_next) 成对推进；eta=0 确定性，>0 可注入少量噪声
-      - 不传 n_steps 则走连续相邻步（仍用 DDIM 公式, t_next=t_cur-1）
+      - solver='ddim': 使用 (t_cur, t_next) 成对推进；eta=0 确定性，>0 可注入少量噪声
+      - solver='ddpm': 退化为原始 DDPM 后验采样（仅支持相邻步，忽略 --n-steps 跳步）
     """
 
     def __init__(
@@ -60,6 +60,7 @@ class FreqGuidedDiffuser3D(nn.Module):
         n_steps: Optional[int] = None,     # DDIM 跳步数；None=连续
         init_from_base: bool = True,
         ddim_eta: float = 0.0,             # DDIM 方差系数；0=确定性
+        solver: str = "ddim",
     ):
         super().__init__()
         self.denoise3d = denoise3d
@@ -77,6 +78,10 @@ class FreqGuidedDiffuser3D(nn.Module):
         self.n_steps = None if (n_steps is None) else int(n_steps)
         self.init_from_base = bool(init_from_base)
         self.ddim_eta = float(ddim_eta)
+        solver = solver.lower().strip()
+        if solver not in {"ddim", "ddpm"}:
+            raise ValueError(f"solver must be 'ddim' or 'ddpm', got {solver!r}")
+        self.solver = solver
 
         # 掩模缓存
         self.register_buffer("_mask_A", None, persistent=False)
@@ -85,31 +90,38 @@ class FreqGuidedDiffuser3D(nn.Module):
     # ---------- 时间表：返回成对 (t_cur, t_next) ----------
     def _schedule_pairs(self, T: int) -> List[Tuple[int, int]]:
         """
-        若 n_steps is None: 连续相邻步 [(T-1, T-2), (T-2, T-3), ...]
-        否则: DDIM 均匀跳步，从 T-1 均匀到 end_t（含两端），再配对相邻端点
+        根据 t_trunc/n_steps 构造 (t_cur, t_next) 对。
+        t_trunc 表示 *起始* 的扩散步索引（例如 10 表示从 t=10 开始逆扩散），
+        当 >=T 时退化为完整采样 (T-1 -> 0)。
+        
+        若 n_steps is None: 使用连续相邻步；否则走 DDIM 均匀跳步。
         """
-        end_t = max(0, T - int(self.t_trunc))
+        start_t = int(self.t_trunc)
+        start_t = max(0, min(T - 1, start_t))  # 限制在有效时间范围内
+        end_t = 0
+
+        if start_t <= end_t:
+            return []
 
         if self.n_steps is None:
-            seq = list(range(T - 1, end_t, -1))  # 不包含 end_t 本身，留给配对的 t_next
-            return [(t, t - 1) for t in seq]     # (T-1,T-2),...,(end_t+1,end_t)
+            seq = list(range(start_t, end_t, -1))  # 不包含 end_t，自行配对
+            return [(t, t - 1) for t in seq]
 
         # DDIM: 均匀取 n_steps 段 -> 需要 n_steps+1 个端点
         S = max(1, int(self.n_steps))
-        grid = torch.linspace(T - 1, end_t, steps=S + 1)
+        grid = torch.linspace(start_t, end_t, steps=S + 1)
         idx = torch.round(grid).to(torch.long).tolist()
 
-        # 严格递减去重
         dedup = []
         for t in idx:
             if not dedup or t < dedup[-1]:
                 dedup.append(int(t))
-        if dedup[0] != T - 1:
-            dedup[0] = T - 1
+        if dedup[0] != start_t:
+            dedup[0] = start_t
         if dedup[-1] != end_t:
             dedup[-1] = end_t
         if len(dedup) < 2:
-            dedup = [T - 1, end_t]
+            dedup = [start_t, end_t]
 
         return [(dedup[i], dedup[i + 1]) for i in range(len(dedup) - 1)]
 
@@ -159,8 +171,9 @@ class FreqGuidedDiffuser3D(nn.Module):
 
         # 2) 时间表 + 初始 x_t
         T = int(getattr(self.denoise3d, "T", len(self.denoise3d.betas)))
+        start_t = max(0, min(T - 1, int(self.t_trunc)))
         pairs = self._schedule_pairs(T)
-        t_start = pairs[0][0]
+        t_start = pairs[0][0] if pairs else start_t
 
         if self.init_from_base:
             x_t = self.denoise3d.q_sample(V_base, t=t_start)
@@ -178,8 +191,18 @@ class FreqGuidedDiffuser3D(nn.Module):
         MA, MP = self._masks(device, A_base.dtype)
 
         alphas_bar = self.denoise3d.alphas_bar.to(device)  # (T,)
+        betas = self.denoise3d.betas.to(device)
 
         # 4) 按 (t_cur -> t_next) 执行 DDIM 更新
+        if self.solver == "ddpm":
+            # DDPM 需要相邻时间步；提前校验
+            for (t_cur, t_next) in pairs:
+                if t_cur - t_next != 1:
+                    raise ValueError(
+                        "DDPM solver requires consecutive timesteps; "
+                        "set n_steps=None or disable DDIM skipping."
+                    )
+
         for (t_cur, t_next) in pairs:
             a_cur = alphas_bar[t_cur].clamp_min(1e-12)
             a_nxt = alphas_bar[t_next].clamp_min(1e-12)
@@ -213,19 +236,32 @@ class FreqGuidedDiffuser3D(nn.Module):
                 (1 - a_cur).clamp_min(1e-12)
             )
 
-            if self.ddim_eta == 0.0:
-                # 确定性 DDIM
-                x_next = torch.sqrt(a_nxt) * x0_hat + torch.sqrt(
-                    (1 - a_nxt).clamp_min(1e-12)
-                ) * eps_tilde
+            if self.solver == "ddpm":
+                beta_t = betas[t_cur].clamp_min(1e-12)
+                a_nxt_bar = alphas_bar[t_next].clamp_min(1e-12)
+                posterior_var = (1 - a_nxt_bar) / (1 - a_cur) * beta_t
+                posterior_var = posterior_var.clamp_min(0.0)
+                coeff_eps = torch.sqrt((1 - a_nxt_bar - posterior_var).clamp_min(0.0))
+                noise = torch.randn_like(x_t) if t_next > 0 else torch.zeros_like(x_t)
+                x_next = (
+                    torch.sqrt(a_nxt_bar) * x0_hat
+                    + coeff_eps * eps_tilde
+                    + torch.sqrt(posterior_var) * noise
+                )
             else:
-                # 随机 DDIM（可选）
-                sigma = self.ddim_eta * torch.sqrt(
-                    (1 - a_nxt) / (1 - a_cur) * (1 - a_cur / a_nxt)
-                ).to(x0_hat.dtype)
-                noise = torch.randn_like(x_t)
-                c = torch.sqrt((1 - a_nxt - sigma**2).clamp_min(0.0))
-                x_next = torch.sqrt(a_nxt) * x0_hat + c * eps_tilde + sigma * noise
+               if self.ddim_eta == 0.0:
+                    # 确定性 DDIM
+                    x_next = torch.sqrt(a_nxt) * x0_hat + torch.sqrt(
+                        (1 - a_nxt).clamp_min(1e-12)
+                    ) * eps_tilde
+                else:
+                    # 随机 DDIM（可选）
+                    sigma = self.ddim_eta * torch.sqrt(
+                        (1 - a_nxt) / (1 - a_cur) * (1 - a_cur / a_nxt)
+                    ).to(x0_hat.dtype)
+                    noise = torch.randn_like(x_t)
+                    c = torch.sqrt((1 - a_nxt - sigma**2).clamp_min(0.0))
+                    x_next = torch.sqrt(a_nxt) * x0_hat + c * eps_tilde + sigma * noise
 
             x_t = x_next
 
